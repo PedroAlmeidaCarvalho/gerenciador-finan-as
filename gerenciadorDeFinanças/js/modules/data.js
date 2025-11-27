@@ -1,3 +1,5 @@
+// js/modules/data.js
+import * as API from './api.js';
 
 // --- Constantes Globais ---
 export const USERS_DB_KEY = 'financasAppUsers';
@@ -7,7 +9,6 @@ export const BUDGET_PERCENTUALS = {
     opcional: 0.30,
     investimento: 0.20
 };
-export let STORAGE_KEY;
 
 // --- Estado da Aplicação ---
 export let currentUser = null;
@@ -16,104 +17,115 @@ export let gastoTotal = 0.00;
 export let gastosPorCategoria = { essencial: 0.00, opcional: 0.00, investimento: 0.00 };
 export let transacoes = [];
 
-// --- Funções de Persistência ---
+// --- Gerenciamento de Estado Local (Cálculos) ---
 
-export function setStorageKey(username) {
-    currentUser = username;
-    STORAGE_KEY = `financasAppDados_${username}`;
-    localStorage.setItem(CURRENT_USER_KEY, username);
-}
-
-export function clearState() {
-    currentUser = null;
-    STORAGE_KEY = null;
-    rendaTotal = 0.00;
-    gastoTotal = 0.00;
+function recalcularTotais() {
+    gastoTotal = 0;
     gastosPorCategoria = { essencial: 0.00, opcional: 0.00, investimento: 0.00 };
-    transacoes = [];
-}
-
-export function saveData() {
-    if (!STORAGE_KEY) return;
-    try {
-        const dados = { rendaTotal, gastoTotal, gastosPorCategoria, transacoes };
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(dados));
-    } catch (error) {
-        console.error('Erro ao salvar dados no localStorage:', error);
-    }
-}
-
-export function loadData() {
-    if (!STORAGE_KEY) return;
-
-    try {
-        const dadosSalvos = localStorage.getItem(STORAGE_KEY);
-        if (dadosSalvos) {
-            const dados = JSON.parse(dadosSalvos);
-            rendaTotal = dados.rendaTotal || 0.00;
-            gastoTotal = dados.gastoTotal || 0.00;
-            gastosPorCategoria = dados.gastosPorCategoria || { essencial: 0, opcional: 0, investimento: 0 };
-            transacoes = dados.transacoes || [];
-        } else {
-            rendaTotal = 0.00;
-            gastoTotal = 0.00;
-            gastosPorCategoria = { essencial: 0.00, opcional: 0.00, investimento: 0.00 };
-            transacoes = [];
+    
+    transacoes.forEach(t => {
+        gastoTotal += t.valor;
+        if (gastosPorCategoria[t.categoria] !== undefined) {
+            gastosPorCategoria[t.categoria] += t.valor;
         }
-    } catch (error) {
-        console.error('Erro ao carregar dados do localStorage:', error);
-        rendaTotal = 0.00;
-        gastoTotal = 0.00;
-        gastosPorCategoria = { essencial: 0.00, opcional: 0.00, investimento: 0.00 };
-        transacoes = [];
-    }
-    // Retorna os dados para serem usados pelos módulos de UI/Dashboard/Transactions
-    return { rendaTotal, transacoes };
+    });
 }
 
-// --- Funções para alterar o estado ---
+// --- Funções de Dados (Agora Assíncronas) ---
+
+export async function loadData() {
+    try {
+        // Tenta carregar do backend
+        const dadosBackend = await API.fetchTransacoes();
+        transacoes = dadosBackend || [];
+        
+        // Renda ainda pode vir do localStorage se o backend não tiver endpoint pra isso
+        // Ou você pode adaptar para salvar a renda no backend também
+        const rendaSalva = localStorage.getItem(`renda_${currentUser}`);
+        rendaTotal = rendaSalva ? parseFloat(rendaSalva) : 0.00;
+
+        recalcularTotais();
+        return { rendaTotal, transacoes };
+    } catch (error) {
+        console.warn('Backend indisponível, usando dados locais ou vazio:', error);
+        // Fallback ou estado vazio
+        return { rendaTotal, transacoes };
+    }
+}
 
 export function setRendaTotal(renda) {
     rendaTotal = renda;
-}
-
-export function addTransaction(despesa) {
-    transacoes.unshift(despesa);
-    gastoTotal += despesa.valor;
-    gastosPorCategoria[despesa.categoria] += despesa.valor;
-}
-
-export function removeTransaction(id) {
-    const transacaoIndex = transacoes.findIndex(t => t.id === id);
-    if (transacaoIndex > -1) {
-        const transacao = transacoes[transacaoIndex];
-        gastoTotal -= transacao.valor;
-        gastosPorCategoria[transacao.categoria] -= transacao.valor;
-        transacoes.splice(transacaoIndex, 1);
-        return true;
+    if (currentUser) {
+        localStorage.setItem(`renda_${currentUser}`, renda);
     }
-    return false;
 }
 
-export function updateTransaction(id, novaDescricao, novoValor, novaCategoria) {
-    const transacao = transacoes.find(t => t.id === id);
-    if (!transacao) return false;
+export async function addTransaction(despesa) {
+    try {
+        // Envia para API
+        const novaDespesa = await API.createTransacao(despesa);
+        
+        // Atualiza estado local com a resposta (que deve ter o ID real do banco)
+        transacoes.unshift(novaDespesa);
+        recalcularTotais();
+        return novaDespesa;
+    } catch (error) {
+        console.error('Erro ao adicionar transação:', error);
+        throw error;
+    }
+}
 
-    const valorAntigo = transacao.valor;
-    const categoriaAntiga = transacao.categoria;
+export async function removeTransaction(id) {
+    try {
+        await API.deleteTransacao(id);
+        
+        const index = transacoes.findIndex(t => t.id === id);
+        if (index > -1) {
+            transacoes.splice(index, 1);
+            recalcularTotais();
+            return true;
+        }
+        return false;
+    } catch (error) {
+        console.error('Erro ao remover transação:', error);
+        return false;
+    }
+}
 
-    gastoTotal = (gastoTotal - valorAntigo) + novoValor;
-    gastosPorCategoria[categoriaAntiga] -= valorAntigo;
-    gastosPorCategoria[novaCategoria] += novoValor;
+export async function updateTransaction(id, novaDescricao, novoValor, novaCategoria) {
+    try {
+        const transacaoAtualizada = {
+            descricao: novaDescricao,
+            valor: novoValor,
+            categoria: novaCategoria
+        };
 
-    transacao.valor = novoValor;
-    transacao.categoria = novaCategoria;
-    transacao.descricao = novaDescricao;
-    return transacao;
+        await API.updateTransacao(id, transacaoAtualizada);
+
+        // Atualiza localmente
+        const index = transacoes.findIndex(t => t.id === id);
+        if (index > -1) {
+            transacoes[index] = { ...transacoes[index], ...transacaoAtualizada };
+            recalcularTotais();
+            return transacoes[index];
+        }
+        return null;
+    } catch (error) {
+        console.error('Erro ao atualizar transação:', error);
+        return null;
+    }
 }
 
 export function resetTransactionData() {
-    gastoTotal = 0.00;
-    gastosPorCategoria = { essencial: 0.00, opcional: 0.00, investimento: 0.00 };
+    // Isso precisaria de um endpoint de "delete all" no backend ou um loop
+    // Por segurança, vamos apenas limpar localmente por enquanto ou implementar loop
     transacoes = [];
+    recalcularTotais();
+    // TODO: Implementar limpeza no backend se necessário
+}
+
+// --- Autenticação ---
+export function setCurrentUser(user) {
+    currentUser = user;
+    localStorage.setItem(CURRENT_USER_KEY, user);
 }
